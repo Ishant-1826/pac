@@ -1,0 +1,20 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary and backup files
+*.bak
+*.swp
+*~
+
+# Submission archives
+*.zip
+
+# Logs and simulation artifacts
+MUJOCO_LOG.TXT
+result.json
+result.yaml
+task0/5541_task0.json
+# Scratch scripts
+task2a/a.py

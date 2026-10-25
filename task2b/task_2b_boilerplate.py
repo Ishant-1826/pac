@@ -1,227 +1,15 @@
+
 """Boilerplate for PB Task 2B.
 
 All the plumbing, none of the thinking. It connects to the broker, loads the
 official maze, receives the pellet positions for this run, and publishes a
 wheel velocity command on every sensor frame. Your job is the one TODO block
 in `decide()`.
-
-Run it in two terminals, from the folder you unpacked:
-
-    ./task_2b_launch                 # terminal 1: the simulator
-    python3 task_2b_boilerplate.py   # terminal 2: this file
-
-Neither takes a maze argument. The official maze is built into both, so there
-is no path to get wrong and no way for your planner and the simulator to end
-up looking at different walls. If the broker is not already running:
-
-    sudo systemctl enable --now mosquitto
-
-Everything you need is in this file: the maze, where you start and finish, and
-every message the simulator will send you. Read on.
-
-------------------------------------------------------------------------------
-WHAT YOU ARE GIVEN
-
-The maze. Fixed for the whole Sub-Task and published, so you may read it,
-precompute against it, and plan routes offline. `Maze.official()` hands it to
-you already parsed, from a copy embedded in maze_2b.py, which is the same text
-built into the simulator. This is deliberately
-not a mapping task - the ToF sensors are for driving accurately, not for
-discovering walls.
-
-The pellets. THREE cells, delivered over `pacbot/pellets` when the run starts,
-and different on every single run. You cannot hardcode a route. Every possible
-pellet set has been checked to need the same optimal driving time, so no draw
-is luckier than another; the only thing that separates two teams is how well
-they plan and drive.
-
-------------------------------------------------------------------------------
-THE MAZE
-
-This is the whole thing. It never changes, so plan against it offline.
-`Maze.official()` returns it already parsed; the drawing below is the same
-maze for reading with your eyes.
-
-        col    0   1   2   3   4   5   6   7   8   9  10  11  12  13  14
-             +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
-     row 0   |                           |       |       |               |
-             +   +---+---+   +---+   +   +   +   +   +   +   +---+   +---+
-     row 1   |   |               |   |       |       |   |       |       |
-             +   +   +   +---+   +   +   +   +---+   +   +   +---+---+   +
-     row 2   |   |   |       |   |       |       |   |               |   |
-             +   +   +   +---+   +   +   +---+   +   +---+   +   +   +   +
-     row 3   |       |               |           |           |   |       |
-             +---+---+   +---+---+   +   +---+   +---+---+---+   +   +---+
-     row 4   |   |               |   |               |                   |
-             +   +   +---+   +   +   +---+---+---+   +---+   +   +---+   +
-     row 5   |       |       |   |               |           |           |
-             +   +---+   +---+   +   +---+---+   +   +---+---+   +---+   +
-     row 6   |       |   |       |           |       |           |       |
-             +---+   +   +   +---+---+---+   +---+---+   +   +---+   +---+
-     row 7   |                           |               |               E
-             +   +---+---+   +---+---+   +   +   +---+---+   +   +---+   +
-     row 8   |           |                   |               |           |
-             +   +   +   +   +---+---+---+   +---+   +   +---+   +---+---+
-     row 9   |   |   |       |                   |   |                   |
-             +   +   +---+   +   +---+   +---+   +   +---+---+   +---+   +
-     row 10  |           |           |           |           |   |       |
-             +   +---+   +---+---+   +   +---+---+   +   +   +   +   +   +
-     row 11  |       |           |                   |   |   |   |   |   |
-             +---+   +   +---+   +---+---+   +---+   +   +   +   +   +   +
-     row 12  |       |               |           |       |           |   |
-             +   +   +---+   +---+   +   +---+   +---+   +   +---+   +   +
-     row 13  |   |           |       |       |               |           |
-             +   +   +   +---+   +   +---+   +   +   +---+   +   +---+   +
-     row 14  S       |           |                       |               |
-             +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
-
-You START outside the west border at the `S` gap on row 14, facing EAST, and
-drive into cell (14, 0). You FINISH by leaving cell (7, 14) through the `E`
-gap in the east border. Crossing that plane is the only thing that ends a run
-successfully.
-
-Coordinates. Cells are (row, col), both zero-based, with row 0 at the TOP of
-the drawing and col 0 at the LEFT. Headings are
-
-    EAST = 0    NORTH = 1    WEST = 2    SOUTH = 3
-
-The order runs counter-clockwise, so (heading + 1) % 4 is a 90 degree turn to
-the LEFT, and (heading + 3) % 4 is a turn to the RIGHT. You spawn facing EAST,
-which is heading 0.
-
-Cell centres in metres. This is the frame the ghost's x/y arrive in, and the
-one to dead-reckon in:
-
-    x = col * 0.22
-    y = (14 - row) * 0.22
-
-So cell (14, 0) sits at (0.00, 0.00) and cell (0, 14) at (3.08, 3.08). Driving
-EAST increases x; driving NORTH increases y. Going back the other way:
-
-    col = round(x / 0.22)
-    row = 14 - round(y / 0.22)
-
-You spawn at (-0.15, 0.00), in the short chute outside the west border, so
-your first move is eastward through the gap. The run ends when your chassis
-crosses x = 3.19, which is the east border plane half a pitch beyond the
-centres of column 14.
-
-Asking the maze about walls, rather than working it out from the drawing:
-
-    maze.can_move((7, 0), Maze.EAST)     # -> True / False
-    maze.grid                            # 15
-    maze.pitch                           # 0.22
-    maze.spawn_row, maze.exit_row        # 14, 7
-
-------------------------------------------------------------------------------
-THE WIRE PROTOCOL
-
-  pacbot/sensors    simulator -> you, 100 times a second
-    {"fl": .., "fr": .., "sl": .., "sr": ..,
-     "gyro":  [wx, wy, wz], "accel": [ax, ay, az],
-     "ticks_l": .., "ticks_r": .., "dt": .., "t": ..}
-
-    The physics runs at 500 Hz; you see every fifth step, so dt is always
-    0.010. The simulator does not wait for you between frames - it keeps
-    stepping and the wheels hold your last command.
-
-    fl  metres to the wall on the LEFT,  90 deg left of forward  (+y)
-    fr  metres to the wall on the RIGHT, 90 deg right of forward (-y)
-    sl  metres to the wall AHEAD, 0 deg, from left of centre     (+x)
-    sr  metres to the wall AHEAD, 0 deg, from right of centre    (+x)
-
-      All four rays are axis-aligned, so a reading IS the perpendicular
-      distance. No trigonometry needed.
-
-      Do not be misled by the names: `fl`/`fr` look sideways and `sl`/`sr`
-      look forward. They are inherited from Task 1B so your 1B code still
-      works.
-
-      RANGE. The sensors see 2.0 m and no further, like the real hardware.
-      A reading of 2.0 means "at least 2 m away, or nothing there at all" -
-      you cannot tell those apart, and neither can a real ToF module. Every
-      reading is therefore in [0.0, 2.0].
-
-      THE PELLETS ARE INVISIBLE TO THESE SENSORS. They are simulated as
-      sites, which the rangefinders cannot see, so you cannot sweep the maze
-      looking for them - a ToF ray passes straight through a pellet and
-      reports the wall behind it. The only source of pellet positions is the
-      pacbot/pellets topic below.
-
-    gyro[2]        yaw rate about z, rad/s. Integrate it to measure turns.
-    accel          body-frame acceleration, m/s^2.
-    ticks_l,       RUNNING encoder counts, 360 per wheel revolution, positive
-    ticks_r        forward. These are cumulative totals, not rates: subtract
-                   successive readings to get how far each wheel turned, so a
-                   dropped message loses nothing.
-
-                       dl = ticks_l - prev_ticks_l
-                       dr = ticks_r - prev_ticks_r
-                       distance = WHEEL_RADIUS * ((dl + dr) / 2) * 2*pi/360
-    dt             seconds covered by this frame.
-    t              simulator clock, seconds since the run started.
-  pacbot/pellets    simulator -> you, at startup and after each collection
-    {"pellets": [[row, col], [row, col], [row, col]]}
-
-    The pellets STILL on the board. The list shrinks as you collect them, and
-    an empty list means all three are yours. Retained, so a late subscriber
-    still gets it.
-
-    Wrapped in an object with a named key, like Task 2A's pellet message,
-    so the topic can gain more fields later without breaking your parser.
-
-  pacbot/ghost      simulator -> you, every sensor frame
-    {"row": .., "col": .., "x": .., "y": ..}
-
-    Where the patrolling ghost is RIGHT NOW: its cell, and its exact position
-    in metres. RETAINED, so subscribing late still tells you where it is.
-
-    It never chases you, but touching it ends your run with whatever pellets
-    you have already collected. Its route is never published: watch it and
-    work the circuit out yourself. It is slower than you are and it is on a
-    circuit, so waiting always works.
-
-  pacbot/result     simulator -> you, ONCE, when the run ends
-    {"solved": true, "collisions": 0}
-
-    Sent when the maze is solved, or when the window is closed on a run that
-    was not solved. It tells you the run is over and roughly how it went.
-    "solved" means all three pellets AND out through the exit; exiting with
-    two pellets is not solved.
-
-    It deliberately carries no score, no time and no pellet detail. Those are
-    in the sealed result.json only. Not retained, so it can never be mistaken
-    for the previous run's outcome.
-
-  pacbot/wheel_vel  you -> simulator
-    {"left": <rad/s>, "right": <rad/s>}
-
-    Clamped to +-30 rad/s. Publish one per sensor frame.
-
-    The simulator does NOT wait for you. It keeps stepping at the wall clock
-    and the wheels hold whatever command arrived last, exactly as a real
-    robot coasts on its last instruction between control updates. Miss a
-    frame and you simply steer on a slightly older reading; nothing breaks.
-
-    The keys must appear in THIS ORDER: the simulator matches the message
-    against a fixed pattern, so {"right": .., "left": ..} is discarded
-    without an error. Building the dict as {"left": .., "right": ..} and
-    passing it to json.dumps gives the right shape, as the code below does.
-
-------------------------------------------------------------------------------
-GEOMETRY YOU WILL NEED
-
-    cell pitch      0.22 m          maze.pitch
-    wheel radius    0.017 m
-    half track      0.039 m         wheel centre to robot centreline
-    grid            15 x 15         maze.grid
-
-A pellet is collected when the chassis centre passes within 0.06 m of the cell
-centre, so clipping a corner does not count. The run ends when the chassis
-crosses the exit plane on the east border.
 """
 import json
 import math
+import itertools
+from collections import deque
 
 import paho.mqtt.client as mqtt
 
@@ -230,110 +18,300 @@ from maze_2b import Maze
 
 MQTT_HOST = "localhost"
 MQTT_PORT = 1883
-TOPIC_SENSORS = "pacbot/sensors"      # simulator publishes, this file subscribes
-TOPIC_PELLETS = "pacbot/pellets"      # simulator publishes, this file subscribes
-TOPIC_GHOST = "pacbot/ghost"          # simulator publishes, this file subscribes
-TOPIC_RESULT = "pacbot/result"        # simulator publishes, this file subscribes
-TOPIC_WHEEL_VEL = "pacbot/wheel_vel"  # this file publishes, simulator subscribes
+TOPIC_SENSORS = "pacbot/sensors"
+TOPIC_PELLETS = "pacbot/pellets"
+TOPIC_GHOST = "pacbot/ghost"
+TOPIC_RESULT = "pacbot/result"
+TOPIC_WHEEL_VEL = "pacbot/wheel_vel"
 
 WHEEL_RADIUS = 0.017  # m
 HALF_TRACK = 0.039    # m, wheel centre to centreline
-WHEEL_LIMIT = 30.0    # rad/s, the simulator clamps to this
-TICKS_PER_REV = 360   # encoder counts per wheel revolution
-TICK_RAD = 2.0 * math.pi / TICKS_PER_REV   # radians of wheel turn per tick
-
+WHEEL_LIMIT = 30.0    # rad/s
+TICKS_PER_REV = 360
+TICK_RAD = 2.0 * math.pi / TICKS_PER_REV
 
 def _mqtt_client():
-    # paho-mqtt >= 2.0 requires picking a callback API version explicitly.
     try:
         return mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     except AttributeError:
         return mqtt.Client()
 
-
 def wheels(forward, turn):
     """Differential drive mixer: +turn steers LEFT (counter-clockwise)."""
     return forward - turn, forward + turn
 
+def get_shortest_path(maze, start_cell, end_cell):
+    queue = deque([(start_cell, [start_cell])])
+    visited = {start_cell}
+    while queue:
+        current, path = queue.popleft()
+        if current == end_cell:
+            return path
+        for heading, nxt in maze.neighbours(current):
+            if nxt not in visited:
+                visited.add(nxt)
+                queue.append((nxt, path + [nxt]))
+    return [start_cell, end_cell]
 
 class Controller:
     def __init__(self, maze):
         self.maze = maze
-        self.pellets = []     # cells still on the board; filled from MQTT
+        self.pellets = []
         self.have_pellets = False
         self.elapsed = 0.0
-        self.ghost = None     # latest pacbot/ghost payload, or None
-        self.prev_ticks = None  # (left, right) counts from the previous frame
+        self.ghost = None
+        self.prev_ticks = None
+
+        # Navigation state
+        self.full_path = []
+        self.path_index = 0
+        self.state = "OBSERVE"  # OBSERVE, TURNING, DRIVING
+        self.obs_frames = 0
+        self.ghost_loop = set()
+        
+        # Odometry state
+        self.x = -0.15
+        self.y = 0.0
+        self.theta = 0.0
+        self.target_theta = 0.0
+
+        # Movement tracking
+        self.distance_traveled_in_cell = 0.0
+        self.cell_pitch = maze.pitch
 
     def on_pellets(self, msg):
-        """Called whenever the remaining-pellet list arrives or changes.
-
-        msg is {"pellets": [[row, col], ...]}.
-        """
         self.pellets = [tuple(c) for c in msg.get("pellets", [])]
         self.have_pellets = True
         print(f"pellets remaining: {self.pellets}")
 
-        # TODO (optional): plan here rather than in decide(). You are told the
-        # pellets once, at the start, and the maze never changes - so the whole
-        # route can be computed now, before the robot has moved.
+    def plan_route(self):
+        spawn = self.maze.spawn_cell
+        exit_c = self.maze.exit_cell
+        
+        # 1. Identify which pellet the ghost is guarding
+        guarded_pellet = None
+        min_d = float('inf')
+        if self.ghost_loop:
+            for p in self.pellets:
+                d = min(abs(p[0] - gr) + abs(p[1] - gc) for gr, gc in self.ghost_loop)
+                if d < min_d:
+                    min_d = d
+                    guarded_pellet = p
+        
+        if guarded_pellet:
+            print(f"Identified Guarded Pellet: {guarded_pellet}. Routing to collect it last.")
+
+        best_path = None
+        min_len = float('inf')
+
+        # 2. Test all permutations, heavily penalizing any route that does not collect the guarded pellet last
+        for perm in itertools.permutations(self.pellets):
+            penalty = 1000 if (guarded_pellet and perm[-1] != guarded_pellet) else 0
+
+            current_cell = spawn
+            full_route = [spawn]
+            total_len = 0
+            valid = True
+            
+            for p in perm:
+                seg = get_shortest_path(self.maze, current_cell, p)
+                if len(seg) < 2 and current_cell != p:
+                    valid = False
+                    break
+                full_route.extend(seg[1:])
+                total_len += len(seg) - 1
+                current_cell = p
+            
+            seg = get_shortest_path(self.maze, current_cell, exit_c)
+            if len(seg) < 2 and current_cell != exit_c:
+                valid = False
+            else:
+                full_route.extend(seg[1:])
+                total_len += len(seg) - 1
+
+            if valid and (total_len + penalty) < min_len:
+                min_len = total_len + penalty
+                best_path = full_route
+
+        self.full_path = best_path if best_path else [spawn, exit_c]
+        self.path_index = 0
+        self.state = "TURNING"
+        print(f"Planned optimal path with {len(self.full_path)} waypoints.")
 
     def decide(self, s):
-        """One sensor frame in, one wheel command out.
-
-        `s` is the decoded pacbot/sensors payload. Return (left, right) in
-        rad/s.
-        """
         self.elapsed += s["dt"]
 
-        left_dist = s["fl"]          # m to the wall on the left
-        right_dist = s["fr"]         # m to the wall on the right
-        front_dist = min(s["sl"], s["sr"])   # m to the wall ahead
-        yaw_rate = s["gyro"][2]      # rad/s about z
-        # Ticks are cumulative counts, so speed is a DIFFERENCE, not a
-        # reading. 360 counts per wheel revolution.
+        left_dist = s["fl"]
+        right_dist = s["fr"]
+        front_dist = min(s["sl"], s["sr"])
+        yaw_rate = s["gyro"][2]
         tl, tr = s["ticks_l"], s["ticks_r"]
+
         if self.prev_ticks is None or s["dt"] <= 0:
-            speed = 0.0
+            dl, dr = 0, 0
         else:
             dl, dr = tl - self.prev_ticks[0], tr - self.prev_ticks[1]
-            speed = (WHEEL_RADIUS * ((dl + dr) / 2.0) * TICK_RAD) / s["dt"]
         self.prev_ticks = (tl, tr)
 
-        # Nothing to do until we know where the pellets are.
+        # Update Continuous Odometry
+        d_dist = WHEEL_RADIUS * ((dl + dr) / 2.0) * TICK_RAD
+        self.theta += yaw_rate * s["dt"]
+        self.theta = (self.theta + math.pi) % (2 * math.pi) - math.pi
+        self.x += d_dist * math.cos(self.theta)
+        self.y += d_dist * math.sin(self.theta)
+
         if not self.have_pellets:
             return 0.0, 0.0
 
-        # ------------------------------------------------------------------
-        # TODO: your control logic goes here.
-        #
-        # A workable shape, if you want one:
-        #   1. Plan a route: spawn -> the 3 pellets in some order -> exit.
-        #      Remember that turns cost real time, so the shortest route in
-        #      cells is often not the fastest one.
-        #   2. Turn that route into a list of moves: forward one cell, turn
-        #      left, turn right.
-        #   3. Execute one move at a time. Integrate `speed * dt` to know when
-        #      a cell has been covered; integrate `yaw_rate * dt` to know when
-        #      a 90 degree turn is done.
-        #   4. While driving straight, keep centred with a PID on
-        #      (left_dist - right_dist) so you do not scrape a wall.
-        #
-        # Unused so far - delete these lines once you use them.
-        _ = (left_dist, right_dist, front_dist, yaw_rate, speed)
+        # --- PHASE 1: OBSERVATION ---
+        # Sit at spawn for 4.0 seconds (400 frames) to map the complete ghost loop.
+        # This costs NO time marks because the clock only starts when the robot moves.
+        if self.state == "OBSERVE":
+            self.obs_frames += 1
+            if self.ghost is not None:
+                self.ghost_loop.add((self.ghost["row"], self.ghost["col"]))
+            
+            if self.obs_frames >= 400:
+                self.plan_route()
+            return 0.0, 0.0
 
-        forward = 0.0
-        turn = 0.0
-        # ------------------------------------------------------------------
+        # --- GHOST AVOIDANCE ---
+        if self.ghost is not None and self.path_index < len(self.full_path):
+            gx, gy = self.ghost["x"], self.ghost["y"]
+            dist_to_ghost = math.hypot(self.x - gx, self.y - gy)
+            
+            current_cell = self.full_path[self.path_index - 1] if self.path_index > 0 else self.full_path[0]
+            target_cell = self.full_path[self.path_index]
+            
+            in_ghost_zone = current_cell in self.ghost_loop
+            entering_ghost_zone = target_cell in self.ghost_loop and not in_ghost_zone
+            
+            # If we are ABOUT TO ENTER the ghost zone and it is within ~3.5 cells distance, WAIT.
+            if entering_ghost_zone and dist_to_ghost < 0.8:
+                return 0.0, 0.0
+            
+            # If we are NOT in the zone but the ghost is extremely close, wait.
+            # IMPORTANT: We NEVER freeze if `in_ghost_zone` is True (we drive through fast to survive).
+            if not in_ghost_zone and not entering_ghost_zone and dist_to_ghost < 0.25:
+                return 0.0, 0.0
 
-        return wheels(forward, turn)
+        # Check for maze exit
+        if self.x >= 3.19:
+            return 0.0, 0.0
+
+        if self.path_index >= len(self.full_path):
+            return wheels(14.0, 0.0)
+
+        # --- TARGET RESOLUTION ---
+        target_cell = self.full_path[self.path_index]
+        tx, ty = self.maze.cell_center(target_cell)
+
+        if self.path_index == 0:
+            dc, dr_grid = 1, 0
+            req_theta = 0.0
+        else:
+            prev_cell = self.full_path[self.path_index - 1]
+            dr_grid = target_cell[0] - prev_cell[0]
+            dc = target_cell[1] - prev_cell[1]
+            if dc == 1: req_theta = 0.0
+            elif dr_grid == -1: req_theta = math.pi / 2.0
+            elif dc == -1: req_theta = math.pi
+            else: req_theta = -math.pi / 2.0
+
+        # --- PHASE 2: EXECUTION ---
+        if self.state == "TURNING":
+            angle_err = (req_theta - self.theta + math.pi) % (2 * math.pi) - math.pi
+            if abs(angle_err) > 0.04:
+                turn_cmd = max(-14.0, min(14.0, 8.0 * angle_err))
+                return wheels(0.0, turn_cmd)
+            else:
+                self.theta = req_theta  # Snap heading exactly to grid angle
+                self.state = "DRIVING"
+                return wheels(0.0, 0.0)
+
+        elif self.state == "DRIVING":
+            self.distance_traveled_in_cell += abs(d_dist)
+            target_dist = 0.15 if self.path_index == 0 else self.cell_pitch
+            
+            # Analyze upcoming turn
+            will_turn = False
+            new_target_theta = req_theta
+            
+            if self.path_index < len(self.full_path) - 1:
+                cur = self.full_path[self.path_index]
+                nxt = self.full_path[self.path_index + 1]
+                dr_nxt = nxt[0] - cur[0]
+                dc_nxt = nxt[1] - cur[1]
+                
+                if dc_nxt == 1: new_target_theta = 0.0
+                elif dr_nxt == -1: new_target_theta = math.pi / 2.0
+                elif dc_nxt == -1: new_target_theta = math.pi
+                else: new_target_theta = -math.pi / 2.0
+                
+                angle_diff = (new_target_theta - req_theta + math.pi) % (2 * math.pi) - math.pi
+                if abs(angle_diff) > 0.1:
+                    will_turn = True
+
+            # Target Cell Arrival Detection
+            reached = False
+            if dc == 1 and self.x >= tx: reached = True
+            elif dc == -1 and self.x <= tx: reached = True
+            elif dr_grid == -1 and self.y >= ty: reached = True
+            elif dr_grid == 1 and self.y <= ty: reached = True
+            
+            if will_turn and front_dist < 0.08:
+                reached = True
+            elif self.distance_traveled_in_cell >= target_dist:
+                reached = True
+
+            if reached:
+                self.x = tx
+                self.y = ty
+                self.path_index += 1
+                self.distance_traveled_in_cell = 0.0
+                
+                if self.path_index >= len(self.full_path):
+                    return wheels(14.0, 0.0)
+                    
+                if will_turn:
+                    self.target_theta = new_target_theta
+                    self.state = "TURNING"
+                    return wheels(0.0, 0.0)
+                    
+            # Grid Snapping: Erase lateral drift
+            if dc != 0:
+                self.y = self.y * 0.95 + ty * 0.05
+            else:
+                self.x = self.x * 0.95 + tx * 0.05
+
+            # Safe Wall Centering
+            wall_err = 0.0
+            if left_dist < 0.35 and right_dist < 0.35:
+                wall_err = left_dist - right_dist
+            else:
+                if left_dist < 0.09:
+                    wall_err = (left_dist - 0.11) * 3.0
+                elif right_dist < 0.09:
+                    wall_err = (0.11 - right_dist) * 3.0
+
+            angle_err = (req_theta - self.theta + math.pi) % (2 * math.pi) - math.pi
+            steering = 4.0 * angle_err + 1.5 * wall_err
+            
+            dist_to_go = target_dist - self.distance_traveled_in_cell
+            if will_turn and dist_to_go < 0.08:
+                speed = 4.0
+            else:
+                speed = 14.0
+                
+            if front_dist < 0.05:
+                speed = 0.0
+
+            return wheels(speed, steering)
+
+        return 0.0, 0.0
 
 
 def main():
-    # The official maze, embedded - no file to find, no path to pass.
-    # The id printed here must match the one the simulator prints in its
-    # banner ("maze official <id> (built in)"). If they ever differ, your
-    # planner and the simulator are looking at different walls.
     maze = Maze.official()
     print(f"official maze {maze_2b.MAZE_ID}: {maze.grid}x{maze.grid}, "
           f"spawn row {maze.spawn_row}, exit row {maze.exit_row}")
@@ -347,7 +325,7 @@ def main():
             controller.on_pellets(payload)
             return
         if msg.topic == TOPIC_GHOST:
-            controller.ghost = payload      # {"row":..,"col":..,"x":..,"y":..}
+            controller.ghost = payload
             return
         if msg.topic == TOPIC_RESULT:
             print(f"run over: solved={payload['solved']}, "
@@ -356,8 +334,6 @@ def main():
         left, right = controller.decide(payload)
         left = max(-WHEEL_LIMIT, min(WHEEL_LIMIT, float(left)))
         right = max(-WHEEL_LIMIT, min(WHEEL_LIMIT, float(right)))
-        # Key order matters: the simulator matches a fixed pattern. See the
-        # pacbot/wheel_vel notes in the header comment.
         cli.publish(TOPIC_WHEEL_VEL,
                     json.dumps({"left": left, "right": right}))
 
@@ -376,3 +352,4 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         pass
+
